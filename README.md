@@ -37,7 +37,7 @@ reddit-sentiment-analyzer/
 
 ### 1️⃣ Clone the Repository
 ```bash
-git clone https://github.com/<your-username>/reddit-sentiment-analyzer.git
+git clone https://github.com/TarunSon1/reddit-sentiment-analyzer.git
 cd reddit-sentiment-analyzer
 ```
 
