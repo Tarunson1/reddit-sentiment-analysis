@@ -1,288 +1,259 @@
-'''*****************************************************************************
-Purpose: To analyze the sentiments of the reddit
-This program uses Vader SentimentIntensityAnalyzer to calculate the ticker compound value. 
-You can change multiple parameters to suit your needs. See below under "set program parameters."
-Implementation:
-I am using sets for 'x in s' comparison, sets time complexity for "x in s" is O(1) compare to list: O(n).
-Limitations:
-It depends mainly on the defined parameters for current implementation:
-It completely ignores the heavily downvoted comments, and there can be a time when
-the most mentioned ticker is heavily downvoted, but you can change that in upvotes variable.
-Author: github:asad70
--------------------------------------------------------------------
-****************************************************************************'''
+"""
+Reddit Sentiment Analyzer
+-----------------------------------
+- Auto-loads subreddits from 'list of subreddits.csv'
+- Uses data.py (us, blacklist, new_words)
+- Saves both top tickers and sentiment analysis to CSV in /results folder
+"""
 
-import praw
-from data import *
 import time
+import re
+import string
+import logging
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import emoji
+import praw
 import pandas as pd
 import matplotlib.pyplot as plt
 import squarify
+
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
-from nltk.corpus import stopwords
 from nltk.tokenize import RegexpTokenizer
 from nltk.stem import WordNetLemmatizer
-import emoji    # removes emojis
-import re   # removes links
 import en_core_web_sm
-import string
+
+# import ticker data from your data.py
+from data import us, blacklist, new_words
+
+# ---------------- CONFIG ----------------
+CFG = {
+    "subreddit_file": "list of subreddits.csv",
+    "results_dir": "results",  # folder where results will be saved
+    "post_flairs": {"Daily Discussion", "Weekend Discussion", "Discussion"},
+    "good_authors": {"AutoModerator"},
+    "ignore_auth_post": {"example"},
+    "ignore_auth_comment": {"example"},
+    "unique_comment_per_author": True,
+    "post_upvote_ratio": 0.70,
+    "post_min_ups": 20,
+    "comment_min_score": 2,
+    "replace_more_limit": 1,
+    "picks": 10,
+    "picks_analyze": 5,
+    "user_agent": "RedditSentimentAnalyzer/1.0",
+    "client_id": "",
+    "client_secret": "",
+    "username": "",
+    "password": "",
+}
+
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ---------------- GLOBAL NLP RESOURCES ----------------
+SPACY = en_core_web_sm.load()
+STOP_WORDS = SPACY.Defaults.stop_words
+LEMMATIZER = WordNetLemmatizer()
+VADER = SentimentIntensityAnalyzer()
+VADER.lexicon.update(new_words)
+TOKENIZER = RegexpTokenizer(r"\w+|\$[\d\.]+|http\S+")
 
 
-def data_extractor(reddit):
-    '''extracts all the data from reddit
-    Parameter: reddt: reddit obj
-    Return:    posts, c_analyzed, tickers, titles, a_comments, picks, subs, picks_ayz
-                
-                posts: int: # of posts analyzed
-                 c_analyzed: int: # of comments analyzed
-                 tickers: dict: all the tickers found
-                titles: list: list of the title of posts analyzed 
-                 a_comments: dict: all the comments to analyze
-                 picks: int: top picks to analyze
-                 subs: int: # of subreddits analyzed
-                picks_ayz: int: top picks to analyze
-    
-    '''
-    
-    '''############################################################################'''
-    # set the program parameters
-    subs = ['wallstreetbets' ]     # sub-reddit to search
-    post_flairs = {'Daily Discussion', 'Weekend Discussion', 'Discussion'}    # posts flairs to search || None flair is automatically considered
-    goodAuth = {'AutoModerator'}   # authors whom comments are allowed more than once
-    uniqueCmt = True                # allow one comment per author per symbol
-    ignoreAuthP = {'example'}       # authors to ignore for posts 
-    ignoreAuthC = {'example'}       # authors to ignore for comment 
-    upvoteRatio = 0.70         # upvote ratio for post to be considered, 0.70 = 70%
-    ups = 20       # define # of upvotes, post is considered if upvotes exceed this #
-    limit = 1     # define the limit, comments 'replace more' limit
-    upvotes = 2     # define # of upvotes, comment is considered if upvotes exceed this #
-    picks = 10     # define # of picks here, prints as "Top ## picks are:"
-    picks_ayz = 5   # define # of picks for sentiment analysis
-    '''############################################################################'''     
-    
-    posts, count, c_analyzed, tickers, titles, a_comments = 0, 0, 0, {}, [], {}
-    cmt_auth = {}
-    
+# ---------------- HELPER FUNCTIONS ----------------
+def read_subreddits(file_path: str) -> List[str]:
+    """Read subreddit names from CSV file."""
+    file = Path(file_path)
+    if not file.exists():
+        logging.warning(f"File not found: {file}. Using default subreddit 'wallstreetbets'.")
+        return ["wallstreetbets"]
+
+    df = pd.read_csv(file)
+    col = df.columns[0]
+    subs = [str(x).strip() for x in df[col].dropna().unique().tolist() if str(x).strip()]
+    logging.info(f"Loaded {len(subs)} subreddits from {file_path}: {subs}")
+    return subs
+
+
+def clean_comment_text(text: str) -> str:
+    """Remove emojis, URLs, numbers, and punctuation."""
+    no_emoji = emoji.get_emoji_regexp().sub("", text or "")
+    no_urls = re.sub(r"http\S+", "", no_emoji)
+    no_nums = re.sub(r"\d+", "", no_urls)
+    translator = str.maketrans("", "", string.punctuation)
+    return no_nums.translate(translator)
+
+
+def tokenize_and_lemmatize(text: str) -> List[str]:
+    tokens = TOKENIZER.tokenize(text.lower())
+    filtered = [t for t in tokens if t not in STOP_WORDS and t.upper() not in us]
+    return [LEMMATIZER.lemmatize(t) for t in filtered]
+
+
+# ---------------- DATA EXTRACTION ----------------
+def data_extractor(reddit: praw.Reddit, subs: List[str]) -> Tuple[int, int, Dict[str, int], Dict[str, List[str]]]:
+    cfg = CFG
+    posts_count = comments_count = 0
+    tickers_count, ticker_comments, seen_auth_for_ticker = {}, {}, {}
+
     for sub in subs:
+        logging.info(f"Scraping subreddit: r/{sub}")
         subreddit = reddit.subreddit(sub)
-        hot_python = subreddit.hot()    # sorting posts by hot
-        # Extracting comments, symbols from subreddit
-        for submission in hot_python:
-            flair = submission.link_flair_text 
-            author = submission.author.name         
-            
-            # checking: post upvote ratio # of upvotes, post flair, and author 
-            if submission.upvote_ratio >= upvoteRatio and submission.ups > ups and (flair in post_flairs or flair is None) and author not in ignoreAuthP:   
-                submission.comment_sort = 'new'     
-                comments = submission.comments
-                titles.append(submission.title)
-                posts += 1
-                try: 
-                    submission.comments.replace_more(limit=limit)   
-                    for comment in comments:
-                        # try except for deleted account?
-                        try: auth = comment.author.name
-                        except: pass
-                        c_analyzed += 1
-                        
-                        # checking: comment upvotes and author
-                        if comment.score > upvotes and auth not in ignoreAuthC:      
-                            split = comment.body.split(" ")
-                            for word in split:
-                                word = word.replace("$", "")        
-                                # upper = ticker, length of ticker <= 5, excluded words,                     
-                                if word.isupper() and len(word) <= 5 and word not in blacklist and word in us:
-                                    
-                                    # unique comments, try/except for key errors
-                                    if uniqueCmt and auth not in goodAuth:
-                                        try: 
-                                            if auth in cmt_auth[word]: break
-                                        except: pass
-                                        
-                                    # counting tickers
-                                    if word in tickers:
-                                        tickers[word] += 1
-                                        a_comments[word].append(comment.body)
-                                        cmt_auth[word].append(auth)
-                                        count += 1
-                                    else:                               
-                                        tickers[word] = 1
-                                        cmt_auth[word] = [auth]
-                                        a_comments[word] = [comment.body]
-                                        count += 1   
-                except Exception as e: print(e)
-                
-                           
-    return posts, c_analyzed, tickers, titles, a_comments, picks, subs, picks_ayz
+        for submission in subreddit.hot(limit=50):
+            author_name = getattr(submission.author, "name", None)
+            flair = submission.link_flair_text
+
+            if not author_name or author_name in cfg["ignore_auth_post"]:
+                continue
+            if submission.upvote_ratio < cfg["post_upvote_ratio"] or submission.ups <= cfg["post_min_ups"]:
+                continue
+            if flair is not None and flair not in cfg["post_flairs"]:
+                continue
+
+            posts_count += 1
+            submission.comment_sort = "new"
+
+            try:
+                submission.comments.replace_more(limit=cfg["replace_more_limit"])
+            except Exception as e:
+                logging.debug(f"replace_more failed: {e}")
+
+            for comment in submission.comments:
+                c_author = getattr(comment.author, "name", None)
+                if not c_author or c_author in cfg["ignore_auth_comment"]:
+                    continue
+                if comment.score <= cfg["comment_min_score"]:
+                    continue
+                comments_count += 1
+
+                for raw_word in comment.body.split():
+                    word = raw_word.replace("$", "")
+                    if not word.isupper() or len(word) > 5:
+                        continue
+                    if word in blacklist or word not in us:
+                        continue
+
+                    if cfg["unique_comment_per_author"] and c_author not in cfg["good_authors"]:
+                        if c_author in seen_auth_for_ticker.get(word, set()):
+                            break
+
+                    tickers_count[word] = tickers_count.get(word, 0) + 1
+                    ticker_comments.setdefault(word, []).append(comment.body)
+                    seen_auth_for_ticker.setdefault(word, set()).add(c_author)
+
+    return posts_count, comments_count, tickers_count, ticker_comments
 
 
-def print_helper(tickers, picks, c_analyzed, posts, subs, titles, time, start_time):
-    '''prints out top tickers, and most mentioned tickers
-    
-    Parameter:   tickers: dict: all the tickers found
-                 picks: int: top picks to analyze
-                 c_analyzed: int: # of comments analyzed
-                 posts: int: # of posts analyzed
-                 subs: int: # of subreddits analyzed
-                titles: list: list of the title of posts analyzed 
-                 time: time obj: top picks to analyze
-                start_time: time obj: prog start time
+# ---------------- SENTIMENT ANALYSIS ----------------
+def sentiment_analysis(tickers_sorted: Dict[str, int], ticker_comments: Dict[str, List[str]]) -> Dict[str, Dict[str, float]]:
+    top_symbols = list(tickers_sorted.keys())[:CFG["picks_analyze"]]
+    results = {}
 
-    Return: symbols: dict: dict of sorted tickers based on mentions
-            times: list: include # of time top tickers is mentioned
-            top: list: list of top tickers
-    '''    
+    for sym in top_symbols:
+        comments = ticker_comments.get(sym, [])
+        if not comments:
+            results[sym] = {"neg": 0.0, "neu": 0.0, "pos": 0.0, "compound": 0.0}
+            continue
 
-    # sorts the dictionary
-    symbols = dict(sorted(tickers.items(), key=lambda item: item[1], reverse = True))
-    top_picks = list(symbols.keys())[0:picks]
-    time = (time.time() - start_time)
-    
-    # print top picks
-    print("It took {t:.2f} seconds to analyze {c} comments in {p} posts in {s} subreddits.\n".format(t=time, c=c_analyzed, p=posts, s=len(subs)))
-    print("Posts analyzed saved in titles")
-    #for i in titles: print(i)  # prints the title of the posts analyzed
-    
-    
-    print(f"\n{picks} most mentioned tickers: ")
-    times = []
-    top = []
-    for i in top_picks:
-        print(f"{i}: {symbols[i]}")
-        times.append(symbols[i])
-        top.append(f"{i}: {symbols[i]}")
-   
-    return symbols, times, top
-    
-    
-def sentiment_analysis(picks_ayz, a_comments, symbols):
-    '''analyzes sentiment anaylsis of top tickers
-    
-    Parameter:   picks_ayz: int: top picks to analyze
-                 a_comments: dict: all the comments to analyze
-                 symbols: dict: dict of sorted tickers based on mentions
-    Return:      scores: dictionary: dictionary of all the sentiment analysis
+        agg = {"neg": 0.0, "neu": 0.0, "pos": 0.0, "compound": 0.0}
+        valid_count = 0
 
-    '''
-    scores = {}
-     
-    vader = SentimentIntensityAnalyzer()
-    vader.lexicon.update(new_words)     # adding custom words from data.py 
-    picks_sentiment = list(symbols.keys())[0:picks_ayz]
-    
-    for symbol in picks_sentiment:
-        stock_comments = a_comments[symbol]
-        for cmnt in stock_comments:
-    
-            emojiless = emoji.get_emoji_regexp().sub(u'', cmnt) # remove emojis
-            
-            # remove punctuation
-            text_punc  = "".join([char for char in emojiless if char not in string.punctuation])
-            text_punc = re.sub('[0-9]+', '', text_punc)
-                
-            # tokenizeing and cleaning 
-            tokenizer = RegexpTokenizer('\w+|\$[\d\.]+|http\S+')
-            tokenized_string = tokenizer.tokenize(text_punc)
-            lower_tokenized = [word.lower() for word in tokenized_string] # convert to lower case
-            
-            # remove stop words
-            nlp = en_core_web_sm.load()
-            stopwords = nlp.Defaults.stop_words
-            sw_removed = [word for word in lower_tokenized if not word in stopwords]
-            
-            # normalize the words using lematization
-            lemmatizer = WordNetLemmatizer()
-            lemmatized_tokens = ([lemmatizer.lemmatize(w) for w in sw_removed])
-            
-            # calculating sentiment of every word in comments n combining them
-            score_cmnt = {'neg': 0.0, 'neu': 0.0, 'pos': 0.0, 'compound': 0.0}
-            
-            word_count = 0
-            for word in lemmatized_tokens:
-                if word.upper() not in us:
-                    score = vader.polarity_scores(word)
-                    word_count += 1
-                    for key, _ in score.items():
-                        score_cmnt[key] += score[key]    
-                else:
-                    score_cmnt['pos'] = 2.0               
-                    
-            # calculating avg.
-            try:        # handles: ZeroDivisionError: float division by zero
-                for key in score_cmnt:
-                    score_cmnt[key] = score_cmnt[key] / word_count
-            except: pass
-                
-            
-            # adding score the the specific symbol
-            if symbol in scores:
-                for key, _ in score_cmnt.items():
-                    scores[symbol][key] += score_cmnt[key]
-            else:
-                scores[symbol] = score_cmnt        
-    
-        # calculating avg.
-        for key in score_cmnt:
-            scores[symbol][key] = scores[symbol][key] / symbols[symbol]
-            scores[symbol][key]  = "{pol:.3f}".format(pol=scores[symbol][key])
-            
-    return scores
+        for cmnt in comments:
+            cleaned = clean_comment_text(cmnt)
+            tokens = tokenize_and_lemmatize(cleaned)
+            vs = VADER.polarity_scores(" ".join(tokens)) if tokens else VADER.polarity_scores(cleaned)
+            for k in agg:
+                agg[k] += vs[k]
+            valid_count += 1
+
+        results[sym] = {k: round(agg[k] / max(valid_count, 1), 3) for k in agg}
+
+    return results
 
 
-def visualization(picks_ayz, scores, picks, times, top):
-    '''prints sentiment analysis
-       makes a most mentioned picks chart
-       makes a chart of sentiment analysis of top picks
-       
-    Parameter:   picks_ayz: int: top picks to analyze
-                 scores: dictionary: dictionary of all the sentiment analysis
-                 picks: int: most mentioned picks
-                times: list: include # of time top tickers is mentioned
-                top: list: list of top tickers
-    Return:       None
-    '''
-    
-    # printing sentiment analysis 
-    print(f"\nSentiment analysis of top {picks_ayz} picks:")
-    df = pd.DataFrame(scores)
-    df.index = ['Bearish', 'Neutral', 'Bullish', 'Total/Compound']
-    df = df.T
-    print(df)
-    
-    # Date Visualization
-    # most mentioned picks    
-    squarify.plot(sizes=times, label=top, alpha=.7 )
-    plt.axis('off')
-    plt.title(f"{picks} most mentioned picks")
-    #plt.show()
-    
-    # Sentiment analysis
-    df = df.astype(float)
-    colors = ['red', 'springgreen', 'forestgreen', 'coral']
-    df.plot(kind = 'bar', color=colors, title=f"Sentiment analysis of top {picks_ayz} picks:")
-    
-    
-    #plt.show()
+# ---------------- SAVE RESULTS ----------------
+def save_results(tickers_count: Dict[str, int], scores: Dict[str, Dict[str, float]]):
+    results_dir = Path(CFG["results_dir"])
+    results_dir.mkdir(exist_ok=True)
 
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+
+    # Save ticker counts
+    tickers_df = pd.DataFrame(sorted(tickers_count.items(), key=lambda x: x[1], reverse=True), columns=["Ticker", "Mentions"])
+    tickers_path = results_dir / f"top_tickers_{timestamp}.csv"
+    tickers_df.to_csv(tickers_path, index=False)
+
+    # Save sentiment analysis
+    if scores:
+        sentiment_df = pd.DataFrame(scores).T.reset_index().rename(columns={"index": "Ticker"})
+        sentiment_path = results_dir / f"sentiment_scores_{timestamp}.csv"
+        sentiment_df.to_csv(sentiment_path, index=False)
+        logging.info(f"Saved sentiment results → {sentiment_path}")
+
+    logging.info(f"Saved top ticker list → {tickers_path}")
+
+
+# ---------------- VISUALIZATION ----------------
+def print_and_visualize(tickers_count: Dict[str, int], scores: Dict[str, Dict[str, float]]):
+    if not tickers_count:
+        logging.info("No tickers found with the given filters.")
+        return
+
+    sorted_tickers = dict(sorted(tickers_count.items(), key=lambda kv: kv[1], reverse=True))
+    top_n = list(sorted_tickers.keys())[:CFG["picks"]]
+    counts = [sorted_tickers[s] for s in top_n]
+
+    logging.info(f"Top {CFG['picks']} tickers: {dict(list(sorted_tickers.items())[:CFG['picks']])}")
+
+    if scores:
+        df = pd.DataFrame(scores).T.rename(
+            columns={"neg": "Bearish", "neu": "Neutral", "pos": "Bullish", "compound": "Compound"}
+        )
+        print("\nSentiment analysis (top picks analyzed):")
+        print(df)
+
+    plt.figure(figsize=(10, 6))
+    squarify.plot(sizes=counts, label=[f"{s}: {sorted_tickers[s]}" for s in top_n], alpha=0.7)
+    plt.axis("off")
+    plt.title(f"Top {CFG['picks']} Most Mentioned Tickers")
+    plt.show()
+
+    if scores:
+        df = df.astype(float)
+        df.plot(kind="bar", title=f"Sentiment for Top {CFG['picks_analyze']} Tickers")
+        plt.tight_layout()
+        plt.show()
+
+
+# ---------------- MAIN ----------------
 def main():
-    '''main function
-    Parameter:   None
-    Return:       None
-    '''
-    start_time = time.time()
-    
-    # reddit client
-    reddit = praw.Reddit(user_agent="Comment Extraction",
-                         client_id="",
-                         client_secret="",
-                         username="",
-                         password="")
+    start = time.time()
+    subs = read_subreddits(CFG["subreddit_file"])
 
-    posts, c_analyzed, tickers, titles, a_comments, picks, subs, picks_ayz = data_extractor(reddit)
-    symbols, times, top = print_helper(tickers, picks, c_analyzed, posts, subs, titles, time, start_time)
-    scores = sentiment_analysis(picks_ayz, a_comments, symbols)
-    visualization(picks_ayz, scores, picks, times, top)
-    
-if __name__ == '__main__':
+    reddit = praw.Reddit(
+        user_agent=CFG["user_agent"],
+        client_id=CFG["client_id"],
+        client_secret=CFG["client_secret"],
+        username=CFG["username"],
+        password=CFG["password"],
+    )
+
+    posts_count, comments_count, tickers_count, ticker_comments = data_extractor(reddit, subs)
+
+    if not tickers_count:
+        logging.info("No tickers collected. Check subreddit list or filters.")
+        return
+
+    sorted_tickers = dict(sorted(tickers_count.items(), key=lambda kv: kv[1], reverse=True))
+    logging.info(f"Analyzed {comments_count} comments from {posts_count} posts.")
+
+    scores = sentiment_analysis(sorted_tickers, ticker_comments)
+    print_and_visualize(sorted_tickers, scores)
+    save_results(sorted_tickers, scores)
+
+    logging.info(f"Total execution time: {time.time() - start:.2f}s")
+
+
+if __name__ == "__main__":
     main()
-    
